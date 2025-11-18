@@ -1,0 +1,321 @@
+# =================== VP1 Evolution-Aware FNN Classifier ===================
+# ------------------ CONFIG ------------------
+CSV_PATH          = "/content/vp1_model_matrix_with_evo.csv"
+ID_COL            = "sample_id"
+LABEL_COL         = "antigenic_label"
+DRIFT_COL         = "hamming_vs_consensus"  
+TEST_TOP_FRAC     = 0.25                     # top 25% most divergent -> test
+
+# Training
+MAX_EPOCHS        = 60
+BATCH_SIZE        = 128
+BASE_LR           = 8e-4                     
+USE_FOCAL_LOSS    = True
+FOCAL_GAMMA       = 2.0
+
+# Targets for threshold tuning
+TARGET_PRECISION  = 0.92
+VAL_RECALL_FLOOR  = 0.35
+
+# Ensembling (set SEEDS = [42] to disable)
+SEEDS             = [42, 1337, 2025]
+N_MODELS          = len(SEEDS)
+
+# ------------------ Imports ------------------
+import os, json, joblib, numpy as np, pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (precision_recall_curve, average_precision_score, roc_auc_score,
+                             precision_score, recall_score, classification_report, confusion_matrix,
+                             balanced_accuracy_score, matthews_corrcoef)
+from sklearn.feature_selection import VarianceThreshold
+from scipy.special import logit, expit
+from scipy.optimize import minimize
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers, regularizers
+
+np.random.seed(42)
+tf.keras.utils.set_random_seed(42)
+
+# ------------------ Load & prepare data ------------------
+df = pd.read_csv(CSV_PATH)
+assert {ID_COL, LABEL_COL, DRIFT_COL}.issubset(df.columns), f"CSV must include {ID_COL}, {LABEL_COL}, {DRIFT_COL}"
+
+# Features = all numeric columns except ID + LABEL
+feat_cols = [c for c in df.columns if c not in (ID_COL, LABEL_COL)]
+X_df = df[feat_cols].apply(pd.to_numeric, errors="coerce")
+X_df = X_df.fillna(X_df.median(numeric_only=True))
+X_all = X_df.values.astype(np.float32)
+y_all = df[LABEL_COL].astype(int).values
+drift  = df[DRIFT_COL].astype(float).values
+
+# ------------------ Evolution-aware split (top drift -> test) ------------------
+order = np.argsort(drift)              
+cut = int((1.0 - TEST_TOP_FRAC) * len(df))
+idx_test = order[cut:]
+idx_rest = order[:cut]
+
+idx_train_rel, idx_val_rel, _, _ = train_test_split(
+    np.arange(len(idx_rest)), y_all[idx_rest], test_size=0.25, random_state=42, stratify=y_all[idx_rest]
+)
+idx_train = idx_rest[idx_train_rel]
+idx_val   = idx_rest[idx_val_rel]
+
+def describe(name, idx):
+    y = y_all[idx]
+    print(f"[{name}] n={len(idx)} | pos={int((y==1).sum())} ({(y==1).mean():.1%}) | drift {drift[idx].min():.3f}-{drift[idx].max():.3f}")
+describe("train", idx_train); describe("val", idx_val); describe("test", idx_test)
+
+X_train_raw, y_train = X_all[idx_train], y_all[idx_train]
+X_val_raw,   y_val   = X_all[idx_val],   y_all[idx_val]
+X_test_raw,  y_test  = X_all[idx_test],  y_all[idx_test]
+
+# ------------------ feature pruning ------------------
+# 1) Drop near-constant features
+vt = VarianceThreshold(threshold=1e-5)
+X_train_vt = vt.fit_transform(X_train_raw)
+X_val_vt   = vt.transform(X_val_raw)
+X_test_vt  = vt.transform(X_test_raw)
+kept_cols_vt = np.array(feat_cols)[vt.get_support()]
+
+# 2) Drop highly collinear features (>0.98)
+def drop_high_corr(X, cols, thr=0.98):
+    corr = np.corrcoef(X, rowvar=False)
+    keep = np.ones(corr.shape[0], dtype=bool)
+    for i in range(corr.shape[0]):
+        if keep[i]:
+            keep[(np.abs(corr[i]) > thr) & (np.arange(corr.shape[0]) > i)] = False
+    return X[:, keep], cols[keep], keep
+
+X_train_fc, kept_cols_fc, keep_mask = drop_high_corr(X_train_vt, kept_cols_vt, thr=0.98)
+X_val_fc   = X_val_vt[:, keep_mask]
+X_test_fc  = X_test_vt[:, keep_mask]
+feat_cols_final = kept_cols_fc.tolist()
+print(f"[features] kept {len(feat_cols_final)} of {len(feat_cols)}")
+
+# ------------------ Scale (fit on train only) ------------------
+scaler = StandardScaler()
+X_train = scaler.fit_transform(X_train_fc).astype(np.float32)
+X_val   = scaler.transform(X_val_fc).astype(np.float32)
+X_test  = scaler.transform(X_test_fc).astype(np.float32)
+
+# ------------------ Class weights ------------------
+pos_frac  = max(1e-6, (y_train==1).mean())
+w_pos = float((1.0 - pos_frac) / pos_frac)  # inverse frequency
+class_weights = {0: 1.0, 1: w_pos}
+print(f"[class weights] pos_frac={pos_frac:.3f} -> w_pos={w_pos:.2f}")
+
+# ------------------ Loss: focal or BCE (no compile-time metrics) ------------------
+def focal_loss(alpha_pos=0.75, gamma=2.0):
+    alpha_pos = tf.constant(alpha_pos, dtype=tf.float32)
+    def loss(y_true, y_pred):
+        y_true = tf.cast(y_true, tf.float32)
+        y_pred = tf.clip_by_value(y_pred, 1e-6, 1-1e-6)
+        p_t = y_true*y_pred + (1-y_true)*(1-y_pred)
+        alpha_t = y_true*alpha_pos + (1-y_true)*(1.0 - alpha_pos)
+        return -tf.reduce_mean(alpha_t * tf.pow(1.0 - p_t, gamma) * tf.math.log(p_t))
+    return loss
+
+loss_fn = focal_loss(alpha_pos=float(1.0 - pos_frac), gamma=FOCAL_GAMMA) if USE_FOCAL_LOSS else "binary_crossentropy"
+
+# ------------------ Warmup + Cosine LR schedule ------------------
+class WarmupCosine(tf.keras.optimizers.schedules.LearningRateSchedule):
+    def __init__(self, base_lr, warmup_steps, total_steps):
+        super().__init__()
+        self.base_lr = tf.cast(base_lr, tf.float32)
+        self.warmup_steps = tf.cast(max(1, int(warmup_steps)), tf.float32)
+        self.total_steps  = tf.cast(max(1, int(total_steps)), tf.float32)
+
+    def __call__(self, step):
+        step = tf.cast(step, tf.float32)
+        warmup_lr = self.base_lr * step / self.warmup_steps
+        progress = tf.clip_by_value(
+            (step - self.warmup_steps) / tf.maximum(1.0, self.total_steps - self.warmup_steps),
+            0.0, 1.0
+        )
+        decay_lr = 0.5 * self.base_lr * (1.0 + tf.cos(np.pi * progress))
+        return tf.where(step < self.warmup_steps, warmup_lr, decay_lr)
+
+    def get_config(self):
+        return {
+            "base_lr": float(self.base_lr.numpy()),
+            "warmup_steps": int(self.warmup_steps.numpy()),
+            "total_steps": int(self.total_steps.numpy()),
+        }
+
+# ------------------ Model factory ------------------
+def make_fnn(input_dim:int, seed:int) -> keras.Model:
+    tf.keras.utils.set_random_seed(seed)
+    kr = regularizers.l2(1e-4)
+
+    inp = keras.Input(shape=(input_dim,))
+    x = layers.GaussianNoise(0.05)(inp)
+
+    x = layers.Dense(512, activation="relu", kernel_regularizer=kr)(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Dropout(0.40)(x)
+
+    x = layers.Dense(192, activation="relu", kernel_regularizer=kr)(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Dropout(0.35)(x)
+
+    x = layers.Dense(96, activation="relu", kernel_regularizer=kr)(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Dropout(0.30)(x)
+
+    out = layers.Dense(1, activation="sigmoid")(x)
+    model = keras.Model(inp, out)
+
+    steps_per_epoch = max(1, len(X_train)//BATCH_SIZE)
+    warmup_steps = int(2.5 * steps_per_epoch)
+    total_steps  = int(MAX_EPOCHS * steps_per_epoch)
+
+    lr_schedule = WarmupCosine(BASE_LR, warmup_steps, total_steps)
+    optimizer = keras.optimizers.Adam(learning_rate=lr_schedule)
+
+    model.compile(optimizer=optimizer, loss=loss_fn)  # <<< no compile-time metrics
+    return model
+
+# ------------------ Callback: compute PR/ROC on validation + checkpoint ------------------
+class ValAUCAndCheckpoint(keras.callbacks.Callback):
+    def __init__(self, Xv, yv, patience=10, ckpt_path=None):
+        super().__init__()
+        self.Xv, self.yv = Xv, yv
+        self.best = -np.inf
+        self.wait = 0
+        self.patience = patience
+        self.ckpt_path = ckpt_path
+        self.history = {"val_pr_auc": [], "val_roc_auc": [], "val_loss": []}
+
+    def on_epoch_end(self, epoch, logs=None):
+        logs = logs or {}
+        val_loss = logs.get("val_loss", np.nan)
+        self.history["val_loss"].append(val_loss)
+
+        p = self.model.predict(self.Xv, verbose=0).ravel().clip(1e-6, 1-1e-6)
+        pr = average_precision_score(self.yv, p)
+        roc = roc_auc_score(self.yv, p)
+        self.history["val_pr_auc"].append(pr)
+        self.history["val_roc_auc"].append(roc)
+
+        if pr > self.best + 1e-5:
+            self.best = pr
+            self.wait = 0
+            if self.ckpt_path:
+                self.model.save(self.ckpt_path, overwrite=True)
+        else:
+            self.wait += 1
+            if self.wait >= self.patience:
+                self.model.stop_training = True
+
+        print(f"Epoch {epoch+1}: val_pr_auc={pr:.4f} | val_roc_auc={roc:.4f} | val_loss={val_loss:.4f}")
+
+# ------------------ Train (optionally with small ensemble) ------------------
+os.makedirs("/content/artifacts", exist_ok=True)
+histories = []
+models = []
+for seed in SEEDS[:N_MODELS]:
+    print(f"\n===== Training seed={seed} =====")
+    model = make_fnn(X_train.shape[1], seed)
+    ckpt_path = f"/content/artifacts/tmp_best_seed{seed}.keras"
+    val_cb = ValAUCAndCheckpoint(X_val, y_val, patience=10, ckpt_path=ckpt_path)
+
+    history = model.fit(
+        X_train, y_train,
+        validation_data=(X_val, y_val),
+        epochs=MAX_EPOCHS,
+        batch_size=BATCH_SIZE,
+        class_weight=class_weights,
+        callbacks=[val_cb],
+        verbose=1
+    )
+
+    model = keras.models.load_model(ckpt_path, compile=False)
+    models.append(model)
+    merged = history.history.copy()
+    merged.update(val_cb.history)
+    histories.append(merged)
+
+# ------------------ Temperature calibration on validation (using ensemble prob) ------------------
+eps = 1e-7
+def ensemble_predict(models, X):
+    ps = [m.predict(X, verbose=0).ravel().clip(eps, 1-eps) for m in models]
+    return np.mean(ps, axis=0).clip(eps, 1-eps)
+
+val_p_raw = ensemble_predict(models, X_val)
+val_logit = logit(val_p_raw)
+
+def nll(T):
+    p = expit(val_logit / T[0]).clip(eps, 1-eps)
+    yy = y_val.astype(float)
+    return -np.mean(yy*np.log(p) + (1-yy)*np.log(1-p))
+
+res = minimize(nll, x0=[1.0], bounds=[(0.05, 10.0)])
+T = float(res.x[0])
+print(f"[calibration] temperature T={T:.3f}")
+val_p_cal = expit(val_logit / T)
+
+# ------------------ Threshold tuning on validation ------------------
+def choose_threshold(y_true, prob, prec_target, recall_floor):
+    prec, rec, thr = precision_recall_curve(y_true, prob)
+    thr = np.r_[thr, thr[-1]]  # align lengths
+    cands = [(p,r,t) for p,r,t in zip(prec, rec, thr) if (p >= prec_target and r >= recall_floor)]
+    if cands:
+        p, r, t = sorted(cands, key=lambda x: (-x[1], -x[0]))[0]
+        return float(p), float(r), float(t)
+    f1 = 2*prec*rec/(prec+rec+1e-9)
+    i = int(np.nanargmax(f1))
+    return float(prec[i]), float(rec[i]), float(thr[i])
+
+p_val, r_val, thr = choose_threshold(y_val, val_p_cal, TARGET_PRECISION, VAL_RECALL_FLOOR)
+print(f"\n[val] PR-AUC={average_precision_score(y_val, val_p_cal):.3f} | ROC-AUC={roc_auc_score(y_val, val_p_cal):.3f}")
+print(f"[val] chosen thr={thr:.3f} | precision={p_val:.3f} | recall={r_val:.3f}")
+
+# ------------------ Evaluate ------------------
+def report(name, y_true, prob, thr):
+    pred = (prob >= thr).astype(int)
+    print(f"\n=== {name.upper()} ===  thr={thr:.3f}")
+    print(f"AUC: ROC={roc_auc_score(y_true, prob):.3f} | PR={average_precision_score(y_true, prob):.3f}")
+    print(f"Precision={precision_score(y_true, pred, zero_division=0):.3f} | Recall={recall_score(y_true, pred, zero_division=0):.3f}")
+    print(f"Accuracy={np.mean(y_true==pred):.3f} | Balanced Acc={balanced_accuracy_score(y_true, pred):.3f} | MCC={matthews_corrcoef(y_true, pred):.3f}")
+    print(classification_report(y_true, pred, digits=3))
+    print("Confusion matrix:\n", confusion_matrix(y_true, pred))
+
+test_p_raw = ensemble_predict(models, X_test)
+test_p_cal = expit(logit(test_p_raw) / T)
+
+report("val",  y_val,  val_p_cal,  thr)
+report("test (High-Drift)", y_test, test_p_cal, thr)
+
+# ------------------ Save artifacts ------------------
+for i, m in enumerate(models):
+    m.save(f"/content/artifacts/vp1_fnn_seed{i}.keras")
+joblib.dump(scaler, "/content/artifacts/vp1_fnn_scaler.joblib")
+joblib.dump({
+    "T":T, "threshold":thr, "feat_cols":feat_cols_final, "drift_col":DRIFT_COL,
+    "precision_target":TARGET_PRECISION, "recall_floor":VAL_RECALL_FLOOR,
+    "use_focal":USE_FOCAL_LOSS, "class_weights":class_weights, "seeds":SEEDS[:N_MODELS]
+}, "/content/artifacts/vp1_fnn_meta.joblib")
+print("\nSaved -> /content/artifacts/vp1_fnn_seed*.keras, vp1_fnn_scaler.joblib, vp1_fnn_meta.joblib")
+
+# ------------------ (plots: Loss + PR/ROC tracked by callback ------------------
+import matplotlib.pyplot as plt
+os.makedirs("/content/figs", exist_ok=True)
+
+def savefig(p): plt.tight_layout(); plt.savefig(p, dpi=300, bbox_inches="tight"); print("Saved:", p); plt.show()
+
+def get_series(key):
+    series = [h.get(key, []) for h in histories]
+    if not series: return []
+    L = max((len(s) for s in series), default=0)
+    arr = np.array([np.pad(s, (0, L-len(s)), constant_values=np.nan) for s in series])
+    return np.nanmean(arr, axis=0)
+
+for name in ["loss","val_loss","val_pr_auc","val_roc_auc"]:
+    vals = get_series(name)
+    if len(vals) == 0: continue
+    plt.figure(figsize=(6,4))
+    plt.plot(vals, label=name)
+    plt.xlabel("Epoch"); plt.ylabel(name.replace("_"," ").title()); plt.title(name.upper()); plt.legend(); plt.grid(alpha=0.4)
+    savefig(f"/content/figs/{name}.png")
