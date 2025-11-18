@@ -1,0 +1,179 @@
+import os
+import random
+import numpy as np # Added import
+import tensorflow as tf
+from tensorflow.keras.layers import Embedding, Bidirectional, LSTM, Dense, Input, Dropout
+from tensorflow.keras.models import Model, load_model
+from tensorflow.keras.utils import to_categorical
+from sklearn.model_selection import train_test_split
+
+# ---------------------------
+# Settings (much lighter)
+# ---------------------------
+seq_file = "/content/vp1_cleaned_295_305.fasta"
+window_size = 20        
+embedding_dim = 16      
+lstm_units = 64         
+dropout_rate = 0.2
+batch_size = 32
+epochs = 10              
+validation_split = 0.1
+model_save_path = "bilstm_vp1_fastest.h5"
+random_seed = 42
+
+np.random.seed(random_seed)
+tf.random.set_seed(random_seed)
+random.seed(random_seed)
+
+# ---------------------------
+# 1) Load sequences (same as before)
+# ---------------------------
+def load_sequences(file_path):
+    seqs = []
+    with open(file_path, "r") as f:
+        current = []
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith(">"):
+                if current:
+                    seqs.append("".join(current))
+                    current = []
+            else:
+                current.append(line.upper())
+        if current:
+            seqs.append("".join(current))
+    return [s for s in seqs if len(s) >= 5]
+
+seqs = load_sequences(seq_file)
+print(f"Loaded {len(seqs)} sequences")
+
+# ---------------------------
+# 2) Build alphabet / mapping
+# ---------------------------
+alphabet = sorted(set("".join(seqs)))
+stoi = {c: i+1 for i, c in enumerate(alphabet)}  # reserve 0 for padding
+itos = {i: c for c, i in stoi.items()}
+vocab_size = len(stoi) + 1
+print("Alphabet:", alphabet)
+print("Vocab size:", vocab_size)
+
+def seq_to_int(s): return [stoi[ch] for ch in s if ch in stoi]
+seqs_int = [seq_to_int(s) for s in seqs]
+
+# ---------------------------
+# 3) Training samples (subsampling for speed)
+# ---------------------------
+X_windows, y_targets = [], []
+for ints in seqs_int:
+    if len(ints) <= window_size:
+        continue
+    for start in range(len(ints) - window_size):
+        X_windows.append(ints[start:start + window_size])
+        y_targets.append(ints[start + window_size])
+
+X = np.array(X_windows, dtype=np.int32)
+y = np.array(y_targets, dtype=np.int32)
+print("Total samples before subsampling:", X.shape)
+
+# ⚡ Subsample dataset to speed up training (keep only 50k samples)
+max_samples = 50000
+if X.shape[0] > max_samples:
+    idx = np.random.choice(X.shape[0], max_samples, replace=False)
+    X = X[idx]
+    y = y[idx]
+
+print("Training samples after subsampling:", X.shape)
+
+# Split
+from sklearn.model_selection import train_test_split
+from tensorflow.keras.utils import to_categorical
+X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=validation_split, random_state=random_seed)
+y_train_cat = to_categorical(y_train, num_classes=vocab_size)
+y_val_cat = to_categorical(y_val, num_classes=vocab_size)
+
+# ---------------------------
+# 4) Build model
+# ---------------------------
+inp = tf.keras.Input(shape=(window_size,))
+x = Embedding(input_dim=vocab_size, output_dim=embedding_dim)(inp)
+x = Bidirectional(LSTM(lstm_units))(x)
+x = Dropout(dropout_rate)(x)
+out = Dense(vocab_size, activation='softmax')(x)
+
+model = tf.keras.Model(inputs=inp, outputs=out)
+model.compile(optimizer="adam", loss="categorical_crossentropy", metrics=["accuracy"])
+model.summary()
+
+# ---------------------------
+# 5) Train with early stopping
+# ---------------------------
+callbacks = [
+    tf.keras.callbacks.ModelCheckpoint(model_save_path, monitor='val_loss', save_best_only=True, verbose=1),
+    tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=2, restore_best_weights=True, verbose=1)
+]
+
+history = model.fit(
+    X_train, y_train_cat,
+    validation_data=(X_val, y_val_cat),
+    batch_size=batch_size,
+    epochs=epochs,
+    callbacks=callbacks
+)
+import numpy as np
+
+# ---------------------------
+# Sequence generation function
+# ---------------------------
+def generate_sequence(model, seed_seq, length, temperature=1.0):
+    """
+    Generate a protein sequence given a seed using the trained model.
+    """
+    seq_int = [stoi[ch] for ch in seed_seq if ch in stoi]  # convert seed to ints
+    generated = seq_int.copy()
+
+    for _ in range(length - len(seq_int)):
+        window = generated[-window_size:]  # last window_size tokens
+        x = np.array(window).reshape(1, -1)
+
+        preds = model.predict(x, verbose=0)[0]
+        preds = np.asarray(preds).astype("float64")
+
+        # Apply temperature scaling
+        preds = np.log(preds + 1e-8) / temperature
+        exp_preds = np.exp(preds)
+        preds = exp_preds / np.sum(exp_preds)
+
+        next_index = np.random.choice(len(preds), p=preds)
+        generated.append(next_index)
+
+    # Decode to amino acids
+    return "".join([itos[i] for i in generated if i in itos])
+
+# ---------------------------
+# Generate sequences
+# ---------------------------
+seed = "GIGGMIEGAIEGITKNALAPPT"
+
+similar_sequences = []
+diverse_sequences = []
+
+# Similar (low temperature ~0.7)
+for i in range(10):
+    new_seq = generate_sequence(model, seed, length=302, temperature=0.6)
+    similar_sequences.append(new_seq)
+
+# Diverse (high temperature ~1.3)
+for i in range(10):
+    new_seq = generate_sequence(model, seed, length=302, temperature=1.3)
+    diverse_sequences.append(new_seq)
+
+# ---------------------------
+# Show results
+# ---------------------------
+for i, s in enumerate(similar_sequences, 1):
+    print(f"[Similar {i}]: {s[:60]}...")
+
+for i, s in enumerate(diverse_sequences, 1):
+    print(f"[Diverse {i}]: {s[:60]}...")
